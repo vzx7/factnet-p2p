@@ -52,15 +52,16 @@ final case class Handshake(
 object Handshake {
   val MessageCode: Byte = 0
 
-  implicit val codec: Codec[Handshake] = ??? // todo
+  implicit val codec: Codec[Handshake] =
+    (int32 :: int64 :: variableSizeBytes(uint16, utf8)).as[Handshake]
 }
 
-final case class GetPeers(maxElems: Int) extends NetworkMessage
+final case class GetPeers(maxElems: Int) extends NetworkMessage 
 
 object GetPeers {
   val MessageCode: Byte = 1
 
-  implicit val codec: Codec[GetPeers] = ??? // todo
+  implicit val codec: Codec[GetPeers] = int32.as[GetPeers]
 }
 
 final case class Peers(addresses: List[InetSocketAddress]) extends NetworkMessage
@@ -68,16 +69,15 @@ final case class Peers(addresses: List[InetSocketAddress]) extends NetworkMessag
 object Peers {
   val MessageCode: Byte = 2
 
-  implicit val codec: Codec[Peers] = ??? // todo
+  implicit val codec: Codec[Peers] = listOfN(uint16, implicitly[Codec[InetSocketAddress]]).as[Peers]
 }
 
-final case class GetFacts(requestId: RequestId, tags: List[Tag], ttl: Int, timestamp: Long)
-  extends NetworkMessage
+final case class GetFacts(requestId: RequestId, tags: List[Tag], ttl: Int, timestamp: Long) extends NetworkMessage
 
 object GetFacts {
   val MessageCode: Byte = 3
 
-  implicit val codec: Codec[GetFacts] = ??? // todo
+  implicit val codec: Codec[GetFacts] = (implicitly[Codec[RequestId]] :: listOfN(uint16, implicitly[Codec[Tag]]) :: int32 :: int64).as[GetFacts]
 }
 
 final case class Facts(requestId: RequestId, facts: List[TaggedFact]) extends NetworkMessage
@@ -85,5 +85,6 @@ final case class Facts(requestId: RequestId, facts: List[TaggedFact]) extends Ne
 object Facts {
   val MessageCode: Byte = 4
 
-  implicit val codec: Codec[Facts] = ??? // todo
+  implicit val codec: Codec[Facts] =
+    (implicitly[Codec[RequestId]] :: listOfN(uint16, implicitly[Codec[TaggedFact]])).as[Facts]
 }

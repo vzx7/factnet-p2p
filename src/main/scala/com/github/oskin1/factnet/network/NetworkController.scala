@@ -14,7 +14,6 @@ import com.github.oskin1.factnet.network.domain.RequestId
 import com.github.oskin1.factnet.services.FactsService.{Add, Get, SearchResult}
 import scorex.util.encode.Base16
 
-import scala.collection.mutable
 import scala.util.Random
 
 final class NetworkController(
@@ -39,8 +38,9 @@ final class NetworkController(
   private def binding: Receive = {
     case Bound(localAddress) =>
       log.info(s"Bound to [$localAddress]")
-    // 1. Bootstrap
-    // todo
+      // 1. Bootstrap
+      connectTo(config.knownPeers)
+      context become working
     case CommandFailed(_: Bind) =>
       log.error(s"Failed to bind to [${config.bindAddress}]")
       context stop self
@@ -58,60 +58,117 @@ final class NetworkController(
   private def commands: Receive = {
     case ConnectTo(remoteAddress) =>
     // Connect to the desired address unless the connection to it already exists
-    // todo
+    if (connections.contains(remoteAddress))
+      log.warning(s"A connection to [$remoteAddress] already established")
+    else {
+      log.info(s"Connection to [$remoteAddress]")
+      tcpManager ! Connect(
+        remoteAddress = remoteAddress,
+        options = Nil,
+        timeout = Some(config.connectionTimeout),
+        pullMode = true
+      )
+    }
   }
 
   private def remoteConnections: Receive = {
     case Connected(remoteAddress, localAddress) =>
       log.info(s"Successfully connected to [$localAddress -> $remoteAddress]")
     // 1. try adding new connection to the peers pool
-    // 2. update peers pool
-    // 3. spawn a new connection handler
-    // 4. send handshake to the peer
-    // todo
+      connections.add(remoteAddress, currentTimeMillis()) match {
+        case Left(err) =>
+          log.warning(s"Failed to create new conection to [$remoteAddress]. $err")
+        case Right(updatedPeerStore) =>
+          // 2. update peers pool
+          connections = updatedPeerStore
+          // 3. spawn a new connection handler
+          val connection = sender()
+          val handlerProps = RemotePeerHandler.props(connection, self, remoteAddress)
+          val handler = context.actorOf(handlerProps)
+          context.watch(handler)
+          // 4. send handshake to the peer
+          handler ! SendHandshake(config.localName)
+      }
     case cf @ CommandFailed(Connect(remoteAddress, _, _, _, _)) =>
       log.warning(s"Failed to connect to [$remoteAddress]. ${cf.cause.map(_.getMessage).getOrElse("?")}")
-    // 1. drop failed connection
+      // 1. drop failed connection
+      connections = connections.remove(remoteAddress)
     case ConnectionLost(remoteAddress) =>
-    // 1. remove corresponding handler from the registry
-    // 2. drop lost connection
-    // todo
+      // 1. remove corresponding handler from the registry
+      handlers -= remoteAddress
+      // 2. drop lost connection
+      connections.remove(remoteAddress)
     case MessageFrom(remoteAddress, message, seenAt) =>
-    // 1. update timestamp `remoteAddress` was last seen
-    // 2. handle concrete message
-    // todo
+      // 1. update timestamp `remoteAddress` was last seen
+      connections = connections.seen(remoteAddress, seenAt)
+      // 2. handle concrete message
+      handle(message, remoteAddress, sender())
     case Handshaked(remoteAddress, ts) =>
       log.info(s"A connection to [$remoteAddress] confirmed")
     // 1. confirm connection to `remoteAddress`
+          connections = connections.confirm(remoteAddress, ts)
     // 2. register a handler for a confirmed connection
+        handlers += remoteAddress -> sender()
     // 3. discover more peers if needed
-    // todo
+      val needConnections = config.minConnections - connections.size
+      if (needConnections > 0) {
+        sender() ! GetPeers(needConnections)
+      }
   }
 
   private def search: Receive = {
     case SearchResult(facts, Some(requestId)) =>
     // Handle result of local lookup
     // 1. Find a corresponding requester address in the registry
-    // 2. Find a corresponding handler
-    // 3. Send result to the remote peer
-    // todo
+    if (facts.nonEmpty) {
+      pendingRequests.get(requestId) match {
+        case Some(Some(requestAddress)) =>
+          // 2. Find a corresponding handler
+          handlers.get(requestAddress) match {
+            case Some(handlerRef) =>
+              // 3. Send result to the remote peer
+              handlerRef ! Facts(requestId, facts)
+            case None =>
+              log.warning(s"Handler for [$requestAddress] not found")
+          }
+        case _  =>
+      }
+    }
     case SearchFor(tags) =>
     // Handle local search request
     // 1. Generate request ID
+      val requestId = RequestId(Base16.encode(Random.nextBytes(32)))
     // 2. Register local search request
+      pendingRequests += requestId -> None
     // 3. Broadcast search request to all known peers
-    // todo
+      val message = GetFacts(requestId, tags, 10, currentTimeMillis())
+      broadcastTo(connections.getAll, message)
     case ListConnections =>
       sender() ! Connections(connections.getAll)
   }
 
   /** Connect to given `peers`.
     */
-  private def connectTo(peers: List[InetSocketAddress]): Unit = ??? // todo
+  private def connectTo(peers: List[InetSocketAddress]): Unit =
+    peers.foreach(remoteAddress =>
+      self ! ConnectTo(remoteAddress)
+    )
 
   /** Broadcast a given `message` to a given `peers`.
     */
-  private def broadcastTo(peers: List[InetSocketAddress], message: NetworkMessage): Unit = ??? // todo
+  private def broadcastTo(peers: List[InetSocketAddress], message: NetworkMessage): Unit = {
+    var collectedHandlers = Array.empty[ActorRef]
+    peers.foreach(peer =>
+      handlers.get(peer) match {
+        case Some(handlerRef) =>
+          collectedHandlers = collectedHandlers.appended(handlerRef)
+        case None => log.warning(s"Handler for [$peer] not found")
+      }
+    )
+    collectedHandlers.foreach(handlerRef =>
+      handlerRef ! message
+    )
+  }
 
   /** Handle specific network messages.
     */
@@ -120,27 +177,54 @@ final class NetworkController(
       case GetPeers(maxElems) =>
       // Handle peers request
       // 1. Acquire as much peers from local storage as requested (excluding requester address)
+        val peers = connections.getAll.filterNot(_== senderAddress).take(maxElems)
       // 2. Send peers to the requester
-      // todo
+        if (peers.nonEmpty) {
+          log.info(s"Sending [{$peers.size}] known peers to [$senderAddress]")
+          senderRef ! Peers(peers)
+        }
       case Peers(addresses) =>
       // Handle peers response
       // 1. Select peers we haven't seen before
+        val newPeers = addresses.filterNot(connections.contains)
+        log.info(s"Got [${newPeers.size}] new peers form [$senderAddress]: [${newPeers.mkString(", ")}]")
       // 2. Connect to new peers
-      // todo
+        connectTo(newPeers)
       case req @ GetFacts(requestId, tags, ttl, _) =>
       // Handle search request
       // 1. Perform local lookup
+        factsServiceRef ! Get(tags, Some(requestId))
       // 2. Register request in order to pass results back to the correct requester
-      // 3. Decrement request TTL
-      // 4. Broadcast request to all connections except for the one this request came from (unless request is expired).
-      // todo
+        if (!pendingRequests.contains(requestId)) {
+          pendingRequests += requestId -> Some(senderAddress)
+
+          // 3. Decrement request TTL
+          val ttlRem = ttl - 1
+          // 4. Broadcast request to all connections except for the one this request came from (unless request is expired).
+          if (ttlRem > 0) {
+            val peersToBroadcastTo = connections.getAll.filterNot(_ == senderAddress)
+            broadcastTo(peersToBroadcastTo, req.copy(ttl = ttlRem))
+          }
+        }
       case res @ Facts(requestId, facts) =>
       // Handle search result
       // 1. Try to acquire requester address form the registry
-      // 2a. In case requester address is present find the corresponding handler
-      // 3a. Send search result to the requester
-      // 2b. In case requester address is None save the result to local store
-      // todo
+        pendingRequests.get(requestId) match {
+          case Some(Some(requesterAddress)) =>
+            // 2a. In case requester address is present find the corresponding handler
+            handlers.get(requesterAddress) match {
+              case Some(handlerRef) =>
+                // 3a. Send search result to the requester
+                handlerRef ! res
+              case None =>
+                log.warning(s"Hsndler for [$requesterAddress] not found")
+            }
+          case Some(None) =>
+          // 2b. In case requester address is None save the result to local store
+            factsServiceRef ! Add(facts)
+          case None =>
+            log.info(s"Got a search result for unknown request from [$senderAddress]")
+        }
       case message =>
         log.warning(s"Got an unexpected message [$message] from [$senderAddress]")
     }

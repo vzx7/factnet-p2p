@@ -38,11 +38,22 @@ final class RemotePeerHandler(
   private def handshaking: Receive = {
     case Received(data) =>
       // Try to handle raw message as a handshake otherwise close connection
-      // todo
+      NetworkMessage.decode(data) match {
+        case Attempt.Successful(DecodeResult(_: Handshake, _)) =>
+          log.info(s"Handshake with $remoteAddress")
+          networkControllerRef ! Handshaked(remoteAddress, currentTimeMillis())
+          connection ! ResumeReading
+          context become normal
+        case _ =>
+          log.warning(s"Failed to path handshake message from $remoteAddress")
+          self ! CloseConnection
+      }
     case SendHandshake(localName) =>
       // Send a handshake to the remote peer
       log.info(s"Handshaking with $remoteAddress")
-      // todo
+      val message = Handshake(version = 1, currentTimeMillis(), localName)
+      val rawMessage = NetworkMessage.encode(message)
+      connection ! Write(rawMessage)
   }
 
   // Normal working mode
@@ -78,7 +89,9 @@ final class RemotePeerHandler(
     case message: NetworkMessage =>
       // Send a given network message from the NetworkController to the remote peer
       log.info(s"Sending $message to $remoteAddress")
-      // todo
+      outgoingMessagesCounter += 1
+      val rawMessage = NetworkMessage.encode(message)
+      connection ! Write(rawMessage, Ack(outgoingMessagesCounter))
 
     case CommandFailed(Write(msg, Ack(id))) =>
       log.warning(s"Failed to write ${msg.length} bytes to $remoteAddress, switching to buffering mode")
