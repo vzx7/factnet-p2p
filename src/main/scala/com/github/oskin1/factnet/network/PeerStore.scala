@@ -41,18 +41,33 @@ object PeerStore {
 
   final class Impl(pool: Map[InetSocketAddress, PeerInfo], sizeBound: Int) extends PeerStore {
 
-    def size: Int = ???
+    def size: Int = pool.size
 
-    def add(address: InetSocketAddress, ts: Long): Either[String, PeerStore] = ???
+    def add(address: InetSocketAddress, ts: Long): Either[String, PeerStore] =
+      if (pool.size < sizeBound)
+        Right(new Impl(pool + (address -> PeerInfo(ts, confirmed = false)), sizeBound))
+      else Left("Pool limit exceeded")
 
-    def seen(address: InetSocketAddress, seenAt: Long): PeerStore = ???
+    def seen(address: InetSocketAddress, seenAt: Long): PeerStore = {
+      val updatePool = pool.get(address) match {
+        case Some(peerInfo) => pool.updated(address, peerInfo.copy(lastSeen = seenAt))
+        case None => pool
+      }
+      new Impl(updatePool, sizeBound)
+    }
 
-    def confirm(address: InetSocketAddress, ts: Long): PeerStore = ???
+    def confirm(address: InetSocketAddress, ts: Long): PeerStore = {
+      val updatePool = pool.updated(address, PeerInfo(ts, confirmed = true))
+      new Impl(updatePool, sizeBound)
+    }
 
-    def remove(address: InetSocketAddress): PeerStore = ???
+    def remove(address: InetSocketAddress): PeerStore =
+      new Impl(pool - address, sizeBound)
 
-    def contains(address: InetSocketAddress): Boolean = ???
+    def contains(address: InetSocketAddress): Boolean =
+      pool.contains(address)
 
-    def getAll: List[InetSocketAddress] = ???
+    def getAll: List[InetSocketAddress] =
+      pool.keys.toList
   }
 }
